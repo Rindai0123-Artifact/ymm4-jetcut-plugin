@@ -22,12 +22,17 @@ YMM4（ゆっくりMovieMaker4）用の**ジェットカット（無音カット
 
 ## 📥 インストール
 
-### 方法1: リリースからダウンロード
+### 方法1: 簡単インストール（推奨）
 
-1. [Releases](../../releases) ページから最新の `JetCutPlugin.dll` をダウンロード
-2. YMM4のインストールフォルダ内の `user\plugin\JetCutPlugin\` フォルダを作成
-3. ダウンロードした `JetCutPlugin.dll` をそのフォルダに配置
-4. YMM4を再起動
+1. [Releases](../../releases) または [JetCutPlugin.ymme](./JetCutPlugin.ymme) をダウンロード
+2. ダウンロードした `JetCutPlugin.ymme` をダブルクリック、またはYMM4のウィンドウにドラッグ＆ドロップ
+3. YMM4を再起動
+
+### 方法2: 手動インストール
+
+1. `JetCutPlugin.dll` をダウンロード
+2. YMM4フォルダの `user\plugin\JetCutPlugin\` を作成し、そこに配置
+3. YMM4を再起動
 
 ### 方法2: ソースからビルド
 
@@ -101,7 +106,19 @@ JetCutPlugin/
 └── SilentRegionItem.cs         # 無音区間モデル
 ```
 
-## 📄 ライセンス
+## � リポジトリトピックの設定（開発者向け）
+
+YMM4プラグインポータルに自動的に掲載されやすくするために、GitHubリポジトリの **Topics** に以下のタグを設定することを強く推奨します：
+
+- `ymm4-plugin`
+
+設定方法：
+
+1. GitHubリポジトリの「About」の横にある ⚙️ アイコンをクリック
+2. 「Topics」に `ymm4-plugin` と入力して追加
+3. 保存
+
+## �📄 ライセンス
 
 [MIT License](LICENSE)
 
