@@ -106,19 +106,7 @@ JetCutPlugin/
 └── SilentRegionItem.cs         # 無音区間モデル
 ```
 
-## � リポジトリトピックの設定（開発者向け）
-
-YMM4プラグインポータルに自動的に掲載されやすくするために、GitHubリポジトリの **Topics** に以下のタグを設定することを強く推奨します：
-
-- `ymm4-plugin`
-
-設定方法：
-
-1. GitHubリポジトリの「About」の横にある ⚙️ アイコンをクリック
-2. 「Topics」に `ymm4-plugin` と入力して追加
-3. 保存
-
-## �📄 ライセンス
+## 📄 ライセンス
 
 [MIT License](LICENSE)
 
