@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <OutputPath>$(YMM4DirPath)user\plugin\JetCutPlugin\</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="YukkuriMovieMaker.Plugin">
+      <HintPath>$(YMM4DirPath)YukkuriMovieMaker.Plugin.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="YukkuriMovieMaker.Controls">
+      <HintPath>$(YMM4DirPath)YukkuriMovieMaker.Controls.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="NAudio.Core">
+      <HintPath>$(YMM4DirPath)NAudio.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="NAudio.Wasapi">
+      <HintPath>$(YMM4DirPath)NAudio.Wasapi.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="NAudio.WinMM">
+      <HintPath>$(YMM4DirPath)NAudio.WinMM.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="NAudio">
+      <HintPath>$(YMM4DirPath)NAudio.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>
