@@ -169,4 +169,126 @@ public class AudioAnalyzer
         }
         return Math.Sqrt(sumOfSquares / count);
     }
+
+    /// <summary>
+    /// 指定されたセグメント（使用中区間）内のみで無音区間を検出します。
+    /// 既にカットされたファイルの場合、使用中の区間のみを解析対象にします。
+    /// </summary>
+    /// <param name="filePath">音声/動画ファイルのパス</param>
+    /// <param name="segments">使用中の区間リスト（ファイル内の時間範囲）</param>
+    /// <param name="thresholdDb">無音判定の閾値 (dB)</param>
+    /// <param name="minSilenceDurationMs">最小無音時間 (ms)</param>
+    /// <param name="marginMs">前後マージン (ms)</param>
+    /// <param name="progress">進捗報告</param>
+    /// <param name="cancellationToken">キャンセルトークン</param>
+    public static async Task<AnalysisResult> AnalyzeSegmentsAsync(
+        string filePath,
+        List<(TimeSpan Start, TimeSpan End)> segments,
+        double thresholdDb = -40.0,
+        int minSilenceDurationMs = 500,
+        int marginMs = 100,
+        IProgress<double>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        // セグメントが空 or null なら通常の全体解析にフォールバック
+        if (segments == null || segments.Count == 0)
+            return await AnalyzeAsync(filePath, thresholdDb, minSilenceDurationMs, marginMs, progress, cancellationToken);
+
+        return await Task.Run(() =>
+        {
+            WaveStream waveStream;
+            try { waveStream = new MediaFoundationReader(filePath); }
+            catch { waveStream = new AudioFileReader(filePath); }
+
+            using (waveStream)
+            {
+                var sampleProvider = waveStream.ToSampleProvider();
+                var sampleRate = sampleProvider.WaveFormat.SampleRate;
+                var channels = sampleProvider.WaveFormat.Channels;
+                var totalDuration = waveStream.TotalTime;
+                var samplesPerSecond = (double)(sampleRate * channels);
+
+                var sorted = segments.OrderBy(s => s.Start).ToList();
+
+                var windowSizeSamples = sampleRate * channels / 100; // 10ms window
+                var buffer = new float[windowSizeSamples];
+                var thresholdLinear = Math.Pow(10.0, thresholdDb / 20.0);
+                var silentRegions = new List<SilentRegion>();
+
+                var totalSegmentDuration = sorted.Sum(s => (s.End - s.Start).TotalSeconds);
+                var processedDuration = 0.0;
+
+                // ★ ストリーム位置をセグメント間で一貫して追跡 ★
+                var streamPos = 0L;
+
+                foreach (var seg in sorted)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    var segStartSample = (long)(seg.Start.TotalSeconds * samplesPerSecond);
+                    var segEndSample = (long)(seg.End.TotalSeconds * samplesPerSecond);
+
+                    // 現在のストリーム位置からセグメント開始位置までスキップ
+                    while (streamPos < segStartSample)
+                    {
+                        var toRead = (int)Math.Min(buffer.Length, segStartSample - streamPos);
+                        var read = sampleProvider.Read(buffer, 0, toRead);
+                        if (read == 0) break;
+                        streamPos += read;
+                    }
+
+                    // このセグメント内を解析
+                    var isSilent = false;
+                    var silenceStartSample = 0L;
+
+                    while (streamPos < segEndSample)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+
+                        var toRead = (int)Math.Min(buffer.Length, segEndSample - streamPos);
+                        var samplesRead = sampleProvider.Read(buffer, 0, toRead);
+                        if (samplesRead == 0) break;
+
+                        var rms = CalculateRms(buffer, samplesRead);
+
+                        if (rms <= thresholdLinear)
+                        {
+                            if (!isSilent)
+                            {
+                                silenceStartSample = streamPos;
+                                isSilent = true;
+                            }
+                        }
+                        else
+                        {
+                            if (isSilent)
+                            {
+                                AddSilentRegionIfLongEnough(
+                                    silentRegions, silenceStartSample, streamPos,
+                                    sampleRate, channels, minSilenceDurationMs, marginMs);
+                                isSilent = false;
+                            }
+                        }
+
+                        streamPos += samplesRead;
+                        processedDuration += samplesRead / samplesPerSecond;
+                        if (totalSegmentDuration > 0)
+                            progress?.Report(processedDuration / totalSegmentDuration);
+                    }
+
+                    // セグメント末尾が無音の場合
+                    if (isSilent)
+                    {
+                        AddSilentRegionIfLongEnough(
+                            silentRegions, silenceStartSample, streamPos,
+                            sampleRate, channels, minSilenceDurationMs, marginMs);
+                    }
+                }
+
+                var totalSilenceDuration = TimeSpan.FromTicks(silentRegions.Sum(r => r.Duration.Ticks));
+                return new AnalysisResult(silentRegions, totalDuration, totalSilenceDuration, sampleRate);
+            }
+        }, cancellationToken);
+    }
 }
+

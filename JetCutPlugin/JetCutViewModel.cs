@@ -8,10 +8,10 @@ using Microsoft.Win32;
 namespace JetCutPlugin;
 
 /// <summary>
-/// ジェットカットツールのViewModel v4
-/// ・現在のプロジェクトを自動検出 + 複数プロジェクト手動追加
-/// ・再生位置（秒）以降のメディアを解析
-/// ・無音区間の選択的カット
+/// ジェットカットツールのViewModel v2.0
+/// ・メディアファイルの選択機能
+/// ・既カット状態を考慮したセグメント解析
+/// ・レスポンシブUI対応
 /// </summary>
 public class JetCutViewModel : INotifyPropertyChanged
 {
@@ -35,18 +35,8 @@ public class JetCutViewModel : INotifyPropertyChanged
         _ => $"📂 {Projects.Count}件のプロジェクト"
     };
 
-    // ==== メディアファイル ====
+    // ==== メディアファイル（選択可能） ====
     public ObservableCollection<MediaFileItem> MediaFiles { get; } = new();
-
-    // ==== 再生位置 ====
-
-    private double _startPositionSec;
-    public double StartPositionSec
-    {
-        get => _startPositionSec;
-        set { _startPositionSec = Math.Max(0, value); OnPropertyChanged(); OnPropertyChanged(nameof(StartPositionText)); }
-    }
-    public string StartPositionText => FormatTimeHMS(TimeSpan.FromSeconds(StartPositionSec));
 
     // ==== パラメータ ====
 
@@ -116,11 +106,12 @@ public class JetCutViewModel : INotifyPropertyChanged
     private string _resultText = "";
     public string ResultText { get => _resultText; set { _resultText = value; OnPropertyChanged(); } }
 
-    public bool CanAnalyze => !IsProcessing && Projects.Count > 0;
+    public bool CanAnalyze => !IsProcessing && Projects.Count > 0 && MediaFiles.Any(m => m.IsSelected);
     public bool CanCut => !IsProcessing && HasResult && SelectedCount > 0;
 
     // ==== 内部 ====
     private readonly Dictionary<string, double> _fpsMap = new();
+    private Dictionary<string, List<YmmpEditor.MediaSegment>> _segmentMap = new();
     private CancellationTokenSource? _cts;
 
     // ==== コマンド ====
@@ -130,8 +121,10 @@ public class JetCutViewModel : INotifyPropertyChanged
     public ICommand AnalyzeCommand => new RelayCommand(async _ => await AnalyzeAsync(), _ => CanAnalyze);
     public ICommand CutCommand => new RelayCommand(async _ => await CutAsync(), _ => CanCut);
     public ICommand CancelCommand => new RelayCommand(_ => _cts?.Cancel(), _ => IsProcessing);
-    public ICommand SelectAllCommand => new RelayCommand(_ => SetAll(true));
-    public ICommand DeselectAllCommand => new RelayCommand(_ => SetAll(false));
+    public ICommand SelectAllCommand => new RelayCommand(_ => SetAllSilent(true));
+    public ICommand DeselectAllCommand => new RelayCommand(_ => SetAllSilent(false));
+    public ICommand SelectAllMediaCommand => new RelayCommand(_ => SetAllMedia(true));
+    public ICommand DeselectAllMediaCommand => new RelayCommand(_ => SetAllMedia(false));
 
     // ==== 初期化 ====
     public JetCutViewModel()
@@ -160,19 +153,10 @@ public class JetCutViewModel : INotifyPropertyChanged
             Log($"✅ 検出: {Path.GetFileName(path)}");
         }
 
-        // 再生位置を取得
-        var frame = ProjectDetector.GetCurrentFrame();
-        if (frame > 0)
-        {
-            var fps = YmmpEditor.GetFps(path);
-            StartPositionSec = Math.Round(frame / fps, 1);
-            Log($"📍 再生位置: {FormatTimeHMS(TimeSpan.FromSeconds(StartPositionSec))} (フレーム {frame})");
-        }
-
         RefreshMediaFiles();
         OnPropertyChanged(nameof(ProjectSummary));
         OnPropertyChanged(nameof(CanAnalyze));
-        StatusText = "「🔍 解析」ボタンで無音区間を検出します";
+        StatusText = "メディアファイルを選択して「解析」を押してください";
     }
 
     private void AddProjects()
@@ -216,17 +200,45 @@ public class JetCutViewModel : INotifyPropertyChanged
     {
         MediaFiles.Clear();
         _fpsMap.Clear();
+        _segmentMap.Clear();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var proj in Projects)
         {
             if (!File.Exists(proj.FilePath)) continue;
-            _fpsMap[proj.FilePath] = YmmpEditor.GetFps(proj.FilePath);
+            var fps = YmmpEditor.GetFps(proj.FilePath);
+            _fpsMap[proj.FilePath] = fps;
+
+            // セグメント情報を取得
+            var segments = YmmpEditor.GetMediaSegments(proj.FilePath);
+            foreach (var (filePath, segList) in segments)
+            {
+                if (!_segmentMap.ContainsKey(filePath))
+                    _segmentMap[filePath] = new List<YmmpEditor.MediaSegment>();
+                _segmentMap[filePath].AddRange(segList);
+            }
 
             foreach (var mf in YmmpEditor.GetMediaFilePaths(proj.FilePath))
             {
                 if (seen.Add(mf))
-                    MediaFiles.Add(new MediaFileItem { FilePath = mf, FileName = Path.GetFileName(mf), Status = "—" });
+                {
+                    var segCount = _segmentMap.ContainsKey(mf) ? _segmentMap[mf].Count : 0;
+                    var segInfo = segCount > 1 ? $"（{segCount}セグメント）" : "";
+                    var item = new MediaFileItem
+                    {
+                        FilePath = mf,
+                        FileName = Path.GetFileName(mf),
+                        SegmentInfo = segInfo,
+                        Status = "—",
+                        IsSelected = true
+                    };
+                    item.PropertyChanged += (_, e) =>
+                    {
+                        if (e.PropertyName == nameof(MediaFileItem.IsSelected))
+                            OnPropertyChanged(nameof(CanAnalyze));
+                    };
+                    MediaFiles.Add(item);
+                }
             }
         }
         Log($"🎬 メディアファイル: {MediaFiles.Count}件");
@@ -245,44 +257,55 @@ public class JetCutViewModel : INotifyPropertyChanged
         try
         {
             Log("═══ 解析開始 ═══");
-            if (MediaFiles.Count == 0) { StatusText = "⚠ メディアファイルがありません"; return; }
+            var selectedMedia = MediaFiles.Where(m => m.IsSelected).ToList();
+            if (selectedMedia.Count == 0) { StatusText = "⚠ メディアファイルが選択されていません"; return; }
 
-            var startOffset = TimeSpan.FromSeconds(StartPositionSec);
-            if (startOffset > TimeSpan.Zero)
-                Log($"📍 開始位置: {FormatTimeHMS(startOffset)} 以降を解析");
+            Log($"📁 解析対象: {selectedMedia.Count}件 / 全{MediaFiles.Count}件");
 
             var idx = 1;
-            for (var i = 0; i < MediaFiles.Count; i++)
+            for (var i = 0; i < selectedMedia.Count; i++)
             {
                 _cts.Token.ThrowIfCancellationRequested();
-                var mf = MediaFiles[i];
+                var mf = selectedMedia[i];
                 mf.Status = "解析中…";
-                StatusText = $"解析中: {mf.FileName}  ({i + 1}/{MediaFiles.Count})";
+                StatusText = $"解析中: {mf.FileName}  ({i + 1}/{selectedMedia.Count})";
 
                 try
                 {
-                    var prog = new Progress<double>(p => Progress = (i + p) / MediaFiles.Count * 100);
-                    var result = await AudioAnalyzer.AnalyzeAsync(
-                        mf.FilePath, ThresholdDb,
-                        (int)(MinSilenceSec * 1000), (int)(MarginSec * 1000),
-                        prog, _cts.Token);
+                    var prog = new Progress<double>(p => Progress = (i + p) / selectedMedia.Count * 100);
 
-                    // 開始位置フィルター
-                    var regions = startOffset > TimeSpan.Zero
-                        ? result.SilentRegions.Where(r => r.End > startOffset).ToList()
-                        : result.SilentRegions;
-
-                    mf.Status = $"✅ {regions.Count}箇所";
-                    Log($"  {mf.FileName}: {FormatTimeHMS(result.TotalDuration)} / 無音 {regions.Count}箇所");
-
-                    foreach (var r in regions)
+                    // 既カット状態を考慮: セグメント情報があればセグメント内のみ解析
+                    AnalysisResultWrapper resultWrapper;
+                    if (_segmentMap.TryGetValue(mf.FilePath, out var segments) && segments.Count > 0)
                     {
-                        var adjustedStart = r.Start < startOffset ? startOffset : r.Start;
+                        var segRanges = segments.Select(s => (s.Start, s.End)).ToList();
+                        Log($"  📐 {segments.Count}個のセグメントを検出（既カット状態を考慮）");
+
+                        var result = await AudioAnalyzer.AnalyzeSegmentsAsync(
+                            mf.FilePath, segRanges, ThresholdDb,
+                            (int)(MinSilenceSec * 1000), (int)(MarginSec * 1000),
+                            prog, _cts.Token);
+                        resultWrapper = new(result.SilentRegions, result.TotalDuration);
+                    }
+                    else
+                    {
+                        var result = await AudioAnalyzer.AnalyzeAsync(
+                            mf.FilePath, ThresholdDb,
+                            (int)(MinSilenceSec * 1000), (int)(MarginSec * 1000),
+                            prog, _cts.Token);
+                        resultWrapper = new(result.SilentRegions, result.TotalDuration);
+                    }
+
+                    mf.Status = $"✅ {resultWrapper.Regions.Count}箇所";
+                    Log($"  {mf.FileName}: {FormatTimeHMS(resultWrapper.TotalDuration)} / 無音 {resultWrapper.Regions.Count}箇所");
+
+                    foreach (var r in resultWrapper.Regions)
+                    {
                         SilentRegions.Add(new SilentRegionItem
                         {
                             Index = idx++,
                             SourceFile = mf.FilePath,
-                            Start = adjustedStart,
+                            Start = r.Start,
                             End = r.End,
                             IsSelected = true
                         });
@@ -316,21 +339,37 @@ public class JetCutViewModel : INotifyPropertyChanged
         finally { IsProcessing = false; _cts?.Dispose(); _cts = null; }
     }
 
+    // 解析結果ラッパー
+    private record AnalysisResultWrapper(List<AudioAnalyzer.SilentRegion> Regions, TimeSpan TotalDuration);
+
     // ==== カット実行 ====
 
     private async Task CutAsync()
     {
-        var selected = SilentRegions.Where(r => r.IsSelected).Select(r => r.ToSilentRegion()).ToList();
-        if (selected.Count == 0) return;
+        // 選択中のメディアファイルパスセット
+        var selectedMediaPaths = new HashSet<string>(
+            MediaFiles.Where(m => m.IsSelected).Select(m => m.FilePath),
+            StringComparer.OrdinalIgnoreCase);
+
+        // ソースファイルごとに選択された無音区間をグループ化 → マージ
+        // ※ 選択されたメディアに属する無音区間のみ
+        var silentByFile = SilentRegions
+            .Where(r => r.IsSelected && selectedMediaPaths.Contains(r.SourceFile))
+            .GroupBy(r => r.SourceFile, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(
+                g => g.Key,
+                g => Merge(g.Select(r => r.ToSilentRegion()).ToList()),
+                StringComparer.OrdinalIgnoreCase);
+
+        if (silentByFile.Count == 0) return;
 
         IsProcessing = true;
         Progress = 0;
 
         try
         {
-            var merged = Merge(selected);
             Log("═══ ジェットカット実行 ═══");
-            Log($"選択: {selected.Count}箇所 → マージ後: {merged.Count}箇所");
+            Log($"対象: {silentByFile.Count}ファイル / {silentByFile.Values.Sum(v => v.Count)}箇所");
 
             var totalResult = new YmmpEditor.CutResult(0, 0, 0, TimeSpan.Zero);
             for (var i = 0; i < Projects.Count; i++)
@@ -342,7 +381,7 @@ public class JetCutViewModel : INotifyPropertyChanged
                 Log($"✂ {p.DisplayName}  (バックアップ → .bak)");
 
                 var fps = _fpsMap.GetValueOrDefault(p.FilePath, 30.0);
-                var r = await Task.Run(() => YmmpEditor.ExecuteJetCut(p.FilePath, merged, fps, true));
+                var r = await Task.Run(() => YmmpEditor.ExecuteJetCut(p.FilePath, silentByFile, fps, true));
 
                 Log($"  処理: {r.ItemsProcessed} / 分割: {r.ItemsSplit} / 削除: {r.SilentItemsRemoved} / 短縮: {FormatTimeHMS(r.TimeSaved)}");
                 totalResult = new(totalResult.ItemsProcessed + r.ItemsProcessed, totalResult.ItemsSplit + r.ItemsSplit,
@@ -369,11 +408,17 @@ public class JetCutViewModel : INotifyPropertyChanged
 
     // ==== ユーティリティ ====
 
-    private void SetAll(bool sel)
+    private void SetAllSilent(bool sel)
     {
         foreach (var r in SilentRegions) r.IsSelected = sel;
         OnPropertyChanged(nameof(SelectionSummary));
         OnPropertyChanged(nameof(CanCut));
+    }
+
+    private void SetAllMedia(bool sel)
+    {
+        foreach (var m in MediaFiles) m.IsSelected = sel;
+        OnPropertyChanged(nameof(CanAnalyze));
     }
 
     private void Log(string msg) => LogText += $"[{DateTime.Now:HH:mm:ss}] {msg}\n";
@@ -412,14 +457,27 @@ public class ProjectFileItem(string filePath)
     public override string ToString() => DisplayName;
 }
 
-/// <summary>メディアファイル</summary>
+/// <summary>メディアファイル（選択可能）</summary>
 public class MediaFileItem : INotifyPropertyChanged
 {
     public event PropertyChangedEventHandler? PropertyChanged;
     public string FilePath { get; set; } = "";
     public string FileName { get; set; } = "";
+    public string SegmentInfo { get; set; } = "";
+
+    private bool _isSelected = true;
+    public bool IsSelected
+    {
+        get => _isSelected;
+        set { _isSelected = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsSelected))); }
+    }
+
     private string _status = "";
-    public string Status { get => _status; set { _status = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status))); } }
+    public string Status
+    {
+        get => _status;
+        set { _status = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Status))); }
+    }
 }
 
 /// <summary>RelayCommand</summary>

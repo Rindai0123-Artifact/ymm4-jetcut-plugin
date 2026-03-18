@@ -67,16 +67,16 @@ public class YmmpEditor
     }
 
     /// <summary>
-    /// ymmpファイルに対してジェットカットを実行します
+    /// ymmpファイルに対してジェットカットを実行します (v2.0)
     /// </summary>
     /// <param name="ymmpPath">ymmpファイルのパス</param>
-    /// <param name="silentRegions">無音区間のリスト</param>
+    /// <param name="silentRegionsByFile">メディアファイルパス → 無音区間リスト（ファイル時間座標）</param>
     /// <param name="fps">プロジェクトのFPS</param>
     /// <param name="createBackup">バックアップを作成するか</param>
     /// <returns>カット結果</returns>
     public static CutResult ExecuteJetCut(
         string ymmpPath,
-        List<AudioAnalyzer.SilentRegion> silentRegions,
+        Dictionary<string, List<AudioAnalyzer.SilentRegion>> silentRegionsByFile,
         double fps,
         bool createBackup = true)
     {
@@ -91,13 +91,7 @@ public class YmmpEditor
         var doc = JsonNode.Parse(json);
         if (doc == null) return new CutResult(0, 0, 0, TimeSpan.Zero);
 
-        var fps_val = fps;
-        
-        // プロジェクトからFPS情報を取得（指定がなければ）
-        if (fps_val <= 0)
-        {
-            fps_val = GetProjectFps(doc) ?? 30.0;
-        }
+        var fps_val = fps > 0 ? fps : (GetProjectFps(doc) ?? 30.0);
 
         var itemsProcessed = 0;
         var itemsSplit = 0;
@@ -120,10 +114,7 @@ public class YmmpEditor
             for (var i = 0; i < timelineItems.Count; i++)
             {
                 var item = timelineItems[i];
-                if (item != null)
-                {
-                    sortedItems.Add((i, item));
-                }
+                if (item != null) sortedItems.Add((i, item));
             }
             sortedItems.Sort((a, b) =>
             {
@@ -132,101 +123,114 @@ public class YmmpEditor
                 return frameA.CompareTo(frameB);
             });
 
-            // 各無音区間をフレーム単位に変換
-            var silentFrameRegions = silentRegions
-                .Select(r => (
-                    StartFrame: (int)(r.Start.TotalSeconds * fps_val),
-                    EndFrame: (int)(r.End.TotalSeconds * fps_val)
-                ))
-                .OrderBy(r => r.StartFrame)
-                .ToList();
-
             // 各アイテムを処理
             foreach (var (_, item) in sortedItems)
             {
                 var type = item["$type"]?.GetValue<string>() ?? "";
                 var itemFrame = item["Frame"]?.GetValue<int>() ?? 0;
                 var itemLength = item["Length"]?.GetValue<int>() ?? 0;
-                var itemEnd = itemFrame + itemLength;
 
+                // 非音声アイテム → オフセットのみ適用
                 if (!HasAudioContent(item, type))
                 {
-                    // 非音声アイテムはフレームオフセットを適用してそのまま追加
-                    var cloned = JsonNode.Parse(item.ToJsonString())!;
-                    var newFrame = Math.Max(0, itemFrame - frameOffset);
-                    cloned["Frame"] = newFrame;
-                    newItems.Add(cloned);
-                    continue;
-                }
-
-                itemsProcessed++;
-
-                // このアイテムに重なる無音区間を見つける
-                var overlappingSilences = silentFrameRegions
-                    .Where(s => s.StartFrame < itemEnd && s.EndFrame > itemFrame)
-                    .ToList();
-
-                if (overlappingSilences.Count == 0)
-                {
-                    // 無音区間なし => そのままコピー（オフセット適用）
                     var cloned = JsonNode.Parse(item.ToJsonString())!;
                     cloned["Frame"] = Math.Max(0, itemFrame - frameOffset);
                     newItems.Add(cloned);
                     continue;
                 }
 
-                // 有音区間を計算（無音区間の補集合）
-                var soundRegions = GetSoundRegions(itemFrame, itemEnd, overlappingSilences);
+                var filePath = item["FilePath"]?.GetValue<string>() ?? "";
+
+                // このファイルにカット対象の無音区間がない → そのまま保持（オフセットのみ適用）
+                if (string.IsNullOrEmpty(filePath) ||
+                    !silentRegionsByFile.TryGetValue(filePath, out var fileSilences) ||
+                    fileSilences.Count == 0)
+                {
+                    var cloned = JsonNode.Parse(item.ToJsonString())!;
+                    cloned["Frame"] = Math.Max(0, itemFrame - frameOffset);
+                    newItems.Add(cloned);
+                    continue;
+                }
+
+                itemsProcessed++;
+
+                // ★ ファイル時間座標でこのアイテムの範囲を算出 ★
+                // ContentOffset = このアイテムが元ファイルのどこから再生開始するか
+                var offsetStr = item["ContentOffset"]?.GetValue<string>() ?? "00:00:00";
+                var contentOffset = TimeSpan.TryParse(offsetStr, out var ts) ? ts : TimeSpan.Zero;
+                var fileTimeStart = contentOffset.TotalSeconds;
+                var fileTimeEnd = fileTimeStart + itemLength / fps_val;
+
+                // ファイル時間座標で重なる無音区間を検索
+                var overlapping = fileSilences
+                    .Where(s => s.Start.TotalSeconds < fileTimeEnd && s.End.TotalSeconds > fileTimeStart)
+                    .OrderBy(s => s.Start)
+                    .ToList();
+
+                if (overlapping.Count == 0)
+                {
+                    // 重なる無音なし → そのまま保持
+                    var cloned = JsonNode.Parse(item.ToJsonString())!;
+                    cloned["Frame"] = Math.Max(0, itemFrame - frameOffset);
+                    newItems.Add(cloned);
+                    continue;
+                }
+
+                // ファイル時間座標で有音区間を算出（無音の補集合）
+                var soundRegions = new List<(double Start, double End)>();
+                var current = fileTimeStart;
+                foreach (var sil in overlapping)
+                {
+                    var silStart = Math.Max(sil.Start.TotalSeconds, fileTimeStart);
+                    var silEnd = Math.Min(sil.End.TotalSeconds, fileTimeEnd);
+                    if (current < silStart)
+                        soundRegions.Add((current, silStart));
+                    current = Math.Max(current, silEnd);
+                }
+                if (current < fileTimeEnd)
+                    soundRegions.Add((current, fileTimeEnd));
 
                 if (soundRegions.Count == 0)
                 {
-                    // 全体が無音 => アイテムを削除
+                    // 全体が無音 → アイテムを削除
                     silentItemsRemoved++;
                     frameOffset += itemLength;
                     totalFramesSaved += itemLength;
                     continue;
                 }
 
-                // 有音区間ごとにアイテムを分割
+                // 有音区間ごとにアイテムを分割（連続配置）
                 var isFirst = true;
-                foreach (var (regionStart, regionEnd) in soundRegions)
+                var currentTimelinePos = itemFrame - frameOffset; // このアイテムの開始位置
+                foreach (var (sndStart, sndEnd) in soundRegions)
                 {
-                    var regionLength = regionEnd - regionStart;
-                    if (regionLength <= 0) continue;
+                    var regionLengthFrames = (int)((sndEnd - sndStart) * fps_val);
+                    if (regionLengthFrames <= 0) continue;
 
                     var cloned = JsonNode.Parse(item.ToJsonString())!;
 
-                    // 新しいフレーム位置（オフセット適用）
-                    var newFrame = Math.Max(0, regionStart - frameOffset);
-                    cloned["Frame"] = newFrame;
-                    cloned["Length"] = regionLength;
+                    // タイムライン上に連続配置（前の区間の直後に置く）
+                    cloned["Frame"] = Math.Max(0, currentTimelinePos);
+                    cloned["Length"] = regionLengthFrames;
 
-                    // ContentOffsetを調整（アイテム内の再生開始位置）
-                    // ContentOffsetは "HH:MM:SS" or "HH:MM:SS.FFFFFFF" 形式のTimeSpan文字列
-                    if (!isFirst || regionStart > itemFrame)
-                    {
-                        var offsetStr = item["ContentOffset"]?.GetValue<string>() ?? "00:00:00";
-                        var existingOffset = TimeSpan.TryParse(offsetStr, out var ts) ? ts : TimeSpan.Zero;
-                        var additionalFrames = regionStart - itemFrame;
-                        var additionalTime = TimeSpan.FromSeconds(additionalFrames / fps_val);
-                        var newOffset = existingOffset + additionalTime;
-                        cloned["ContentOffset"] = newOffset.ToString(@"hh\:mm\:ss\.fffffff");
-                    }
+                    // ContentOffset = この分割後アイテムが元ファイルのどこから始まるか
+                    var newContentOffset = TimeSpan.FromSeconds(sndStart);
+                    cloned["ContentOffset"] = newContentOffset.ToString(@"hh\:mm\:ss\.fffffff");
 
                     newItems.Add(cloned);
+                    currentTimelinePos += regionLengthFrames; // 次の区間は直後に
 
                     if (!isFirst) itemsSplit++;
                     isFirst = false;
                 }
 
-                // 無音分のフレームを累計
-                var silenceFrames = overlappingSilences
-                    .Sum(s =>
-                    {
-                        var start = Math.Max(s.StartFrame, itemFrame);
-                        var end = Math.Min(s.EndFrame, itemEnd);
-                        return Math.Max(0, end - start);
-                    });
+                // 無音分のフレームを累計オフセットに加算
+                var silenceFrames = overlapping.Sum(s =>
+                {
+                    var start = Math.Max(s.Start.TotalSeconds, fileTimeStart);
+                    var end = Math.Min(s.End.TotalSeconds, fileTimeEnd);
+                    return (int)(Math.Max(0, end - start) * fps_val);
+                });
                 frameOffset += silenceFrames;
                 totalFramesSaved += silenceFrames;
             }
@@ -241,8 +245,7 @@ public class YmmpEditor
             WriteIndented = true,
             Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
         };
-        var outputJson = doc.ToJsonString(options);
-        File.WriteAllText(ymmpPath, outputJson);
+        File.WriteAllText(ymmpPath, doc.ToJsonString(options));
 
         var timeSaved = TimeSpan.FromSeconds(totalFramesSaved / fps_val);
         return new CutResult(itemsProcessed, itemsSplit, silentItemsRemoved, timeSaved);
@@ -373,5 +376,63 @@ public class YmmpEditor
         }
 
         return paths;
+    }
+
+    /// <summary>
+    /// メディアファイルの使用中セグメント情報
+    /// </summary>
+    public record MediaSegment(TimeSpan Start, TimeSpan End, int TimelineFrame, int TimelineLength);
+
+    /// <summary>
+    /// ymmpファイルから各メディアファイルのタイムライン上での使用区間を取得します。
+    /// ContentOffset と Length(フレーム) から、元ファイル内のどの区間が使用中かを算出します。
+    /// </summary>
+    public static Dictionary<string, List<MediaSegment>> GetMediaSegments(string ymmpPath)
+    {
+        var json = File.ReadAllText(ymmpPath);
+        var doc = JsonNode.Parse(json);
+        var result = new Dictionary<string, List<MediaSegment>>(StringComparer.OrdinalIgnoreCase);
+
+        if (doc == null) return result;
+
+        var fps = GetProjectFps(doc) ?? 30.0;
+        var timelines = doc["Timelines"]?.AsArray();
+        if (timelines == null) return result;
+
+        foreach (var timeline in timelines)
+        {
+            var items = timeline?["Items"]?.AsArray();
+            if (items == null) continue;
+
+            foreach (var item in items)
+            {
+                if (item == null) continue;
+
+                var filePath = item["FilePath"]?.GetValue<string>();
+                if (string.IsNullOrEmpty(filePath)) continue;
+
+                var ext = Path.GetExtension(filePath);
+                if (!MediaExtensions.Supported.Contains(ext)) continue;
+
+                var type = item["$type"]?.GetValue<string>() ?? "";
+                if (!HasAudioContent(item, type)) continue;
+
+                // ContentOffset: "HH:MM:SS" or "HH:MM:SS.FFFFFFF" 形式
+                var offsetStr = item["ContentOffset"]?.GetValue<string>() ?? "00:00:00";
+                var contentOffset = TimeSpan.TryParse(offsetStr, out var ts) ? ts : TimeSpan.Zero;
+                var lengthFrames = item["Length"]?.GetValue<int>() ?? 0;
+                var frame = item["Frame"]?.GetValue<int>() ?? 0;
+
+                var segStart = contentOffset;
+                var segEnd = contentOffset + TimeSpan.FromSeconds(lengthFrames / fps);
+
+                if (!result.ContainsKey(filePath))
+                    result[filePath] = new List<MediaSegment>();
+
+                result[filePath].Add(new MediaSegment(segStart, segEnd, frame, lengthFrames));
+            }
+        }
+
+        return result;
     }
 }
