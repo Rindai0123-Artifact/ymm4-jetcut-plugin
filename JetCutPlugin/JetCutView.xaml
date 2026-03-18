@@ -144,6 +144,16 @@
                         BorderThickness="1" CornerRadius="3" Padding="10,6" Margin="0,2,0,0">
                     <StackPanel>
                         <TextBlock Style="{StaticResource L}" Margin="0,0,0,2" TextWrapping="Wrap">
+                            <Run Text="▶ 解析開始位置" FontWeight="SemiBold"/>
+                            <Run Text="  タイムラインのこの位置以降にあるアイテムだけを解析します" Foreground="#888"/>
+                        </TextBlock>
+                        <DockPanel>
+                            <TextBlock Text="{Binding StartPositionText}" Style="{StaticResource V}" DockPanel.Dock="Right"/>
+                            <Slider Value="{Binding StartPositionSec}" Minimum="0" Maximum="3600"
+                                    TickFrequency="1" IsSnapToTickEnabled="True" VerticalAlignment="Center"/>
+                        </DockPanel>
+
+                        <TextBlock Style="{StaticResource L}" Margin="0,6,0,2" TextWrapping="Wrap">
                             <Run Text="🔊 音量閾値（dB）" FontWeight="SemiBold"/>
                             <Run Text="  この値以下の音量を「無音」と判定します" Foreground="#888"/>
                         </TextBlock>

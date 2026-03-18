@@ -40,6 +40,14 @@ public class JetCutViewModel : INotifyPropertyChanged
 
     // ==== パラメータ ====
 
+    private double _startPositionSec = 0;
+    public double StartPositionSec
+    {
+        get => _startPositionSec;
+        set { _startPositionSec = value; OnPropertyChanged(); OnPropertyChanged(nameof(StartPositionText)); }
+    }
+    public string StartPositionText => _startPositionSec < 1 ? "先頭から" : $"{FormatTimeHMS(TimeSpan.FromSeconds(_startPositionSec))} 以降";
+
     private double _thresholdDb = -40.0;
     public double ThresholdDb
     {
@@ -275,11 +283,25 @@ public class JetCutViewModel : INotifyPropertyChanged
                     var prog = new Progress<double>(p => Progress = (i + p) / selectedMedia.Count * 100);
 
                     // 既カット状態を考慮: セグメント情報があればセグメント内のみ解析
+                    // タイムライン解析開始位置でフィルタ
                     AnalysisResultWrapper resultWrapper;
                     if (_segmentMap.TryGetValue(mf.FilePath, out var segments) && segments.Count > 0)
                     {
-                        var segRanges = segments.Select(s => (s.Start, s.End)).ToList();
-                        Log($"  📐 {segments.Count}個のセグメントを検出（既カット状態を考慮）");
+                        // タイムライン位置でフィルタ（StartPositionSec以降のセグメントのみ）
+                        var startFrame = StartPositionSec * (_fpsMap.Values.FirstOrDefault(30.0));
+                        var filtered = segments
+                            .Where(s => (s.TimelineFrame + s.TimelineLength) > startFrame)
+                            .ToList();
+
+                        if (filtered.Count == 0)
+                        {
+                            mf.Status = "⏭ スキップ";
+                            Log($"  {mf.FileName}: 解析開始位置より前のため対象外");
+                            continue;
+                        }
+
+                        var segRanges = filtered.Select(s => (s.Start, s.End)).ToList();
+                        Log($"  📐 {filtered.Count}個のセグメントを解析（既カット状態を考慮）");
 
                         var result = await AudioAnalyzer.AnalyzeSegmentsAsync(
                             mf.FilePath, segRanges, ThresholdDb,
